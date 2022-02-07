@@ -103,6 +103,7 @@ Maintainer: Michael Coracin
 
 #define STATUS_SIZE     200
 #define TX_BUFF_SIZE    ((540 * NB_PKT_MAX) + 30 + STATUS_SIZE)
+#define ACK_BUFF_SIZE   64
 
 #define UNIX_GPS_EPOCH_OFFSET 315964800 /* Number of seconds ellapsed between 01.Jan.1970 00:00:00
                                                                           and 06.Jan.1980 00:00:00 */
@@ -884,9 +885,10 @@ static double difftimespec(struct timespec end, struct timespec beginning) {
     return x;
 }
 
-static int send_tx_ack(uint8_t token_h, uint8_t token_l, enum jit_error_e error) {
-    uint8_t buff_ack[64]; /* buffer to give feedback to server */
+static int send_tx_ack(uint8_t token_h, uint8_t token_l, enum jit_error_e error, int32_t error_value) {
+    uint8_t buff_ack[ACK_BUFF_SIZE]; /* buffer to give feedback to server */
     int buff_index;
+    int j;
 
     /* reset buffer */
     memset(&buff_ack, 0, sizeof buff_ack);
@@ -905,9 +907,20 @@ static int send_tx_ack(uint8_t token_h, uint8_t token_l, enum jit_error_e error)
         /* start of JSON structure */
         memcpy((void *)(buff_ack + buff_index), (void *)"{\"txpk_ack\":{", 13);
         buff_index += 13;
-        /* set downlink error status in JSON structure */
-        memcpy((void *)(buff_ack + buff_index), (void *)"\"error\":", 8);
-        buff_index += 8;
+
+        /* set downlink error/warning status in JSON structure */
+        switch (error) {
+            case JIT_ERROR_TX_POWER:
+                memcpy((void *)(buff_ack + buff_index), (void *)"\"warn\":", 7);
+                buff_index += 7;
+                break;
+            default:
+                memcpy((void *)(buff_ack + buff_index), (void *)"\"error\":", 8);
+                buff_index += 8;
+                break;
+        }
+
+        /* set error/warning type in JSON structure */
         switch (error) {
             case JIT_ERROR_FULL:
             case JIT_ERROR_COLLISION_PACKET:
@@ -959,6 +972,23 @@ static int send_tx_ack(uint8_t token_h, uint8_t token_l, enum jit_error_e error)
                 buff_index += 9;
                 break;
         }
+
+        /* set error/warning details in JSON structure */
+        switch (error) {
+            case JIT_ERROR_TX_POWER:
+                j = snprintf((char *)(buff_ack + buff_index), ACK_BUFF_SIZE-buff_index, ",\"value\":%d", error_value);
+                if (j > 0) {
+                    buff_index += j;
+                } else {
+                    MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                    exit(EXIT_FAILURE);
+                }
+                break;
+            default:
+                /* Do nothing */
+                break;
+        }
+
         /* end of JSON structure */
         memcpy((void *)(buff_ack + buff_index), (void *)"}}", 2);
         buff_index += 2;
@@ -1883,6 +1913,45 @@ void thread_up(void) {
 /* -------------------------------------------------------------------------- */
 /* --- THREAD 2: POLLING SERVER AND ENQUEUING PACKETS IN JIT QUEUE ---------- */
 
+static int get_tx_gain_lut_index(int8_t rf_power, uint8_t * lut_index) {
+    uint8_t pow_index;
+    int current_best_index = -1;
+    uint8_t current_best_match = 0xFF;
+    int diff;
+
+    /* Check input parameters */
+    if (lut_index == NULL) {
+        MSG("ERROR: %s - wrong parameter\n", __FUNCTION__);
+        return -1;
+    }
+
+    /* Search requested power in TX gain LUT */
+    for (pow_index = 0; pow_index < txlut.size; pow_index++) {
+        diff = rf_power - txlut.lut[pow_index].rf_power;
+        if (diff < 0) {
+            /* The selected power must be lower or equal to requested one */
+            continue;
+        } else {
+            /* Record the index corresponding to the closest rf_power available in LUT */
+            if ((current_best_index == -1) || (diff < current_best_match)) {
+                current_best_match = diff;
+                current_best_index = pow_index;
+            }
+        }
+    }
+
+    /* Return corresponding index */
+    if (current_best_index > -1) {
+        *lut_index = (uint8_t)current_best_index;
+    } else {
+        *lut_index = 0;
+        MSG("ERROR: %s - failed to find tx gain lut index\n", __FUNCTION__);
+        return -1;
+    }
+
+    return 0;
+}
+
 void thread_down(void) {
     int i; /* loop variables */
 
@@ -1941,7 +2010,9 @@ void thread_down(void) {
     struct timeval current_unix_time;
     struct timeval current_concentrator_time;
     enum jit_error_e jit_result = JIT_ERROR_OK;
+    enum jit_error_e warning_result = JIT_ERROR_OK;
     enum jit_pkt_type_e downlink_type;
+    int32_t warning_value = 0;
 
     /* set downstream socket RX timeout */
     i = setsockopt(sock_down, SOL_SOCKET, SO_RCVTIMEO, (void *)&pull_timeout, sizeof pull_timeout);
@@ -2279,7 +2350,7 @@ void thread_down(void) {
                             json_value_free(root_val);
 
                             /* send acknoledge datagram to server */
-                            send_tx_ack(buff_down[1], buff_down[2], JIT_ERROR_GPS_UNLOCKED);
+                            send_tx_ack(buff_down[1], buff_down[2], JIT_ERROR_GPS_UNLOCKED, warning_value);
                             continue;
                         }
                     } else {
@@ -2287,7 +2358,7 @@ void thread_down(void) {
                         json_value_free(root_val);
 
                         /* send acknoledge datagram to server */
-                        send_tx_ack(buff_down[1], buff_down[2], JIT_ERROR_GPS_UNLOCKED);
+                        send_tx_ack(buff_down[1], buff_down[2], JIT_ERROR_GPS_UNLOCKED, warning_value);
                         continue;
                     }
 
@@ -2507,23 +2578,23 @@ void thread_down(void) {
             meas_dw_payload_byte += txpkt.size;
             pthread_mutex_unlock(&mx_meas_dw);
 
+            jit_result = warning_result = JIT_ERROR_OK;
+            warning_value = 0;
+
             /* check TX parameter before trying to queue packet */
-            jit_result = JIT_ERROR_OK;
             if ((txpkt.freq_hz < tx_freq_min[txpkt.rf_chain]) || (txpkt.freq_hz > tx_freq_max[txpkt.rf_chain])) {
                 jit_result = JIT_ERROR_TX_FREQ;
                 MSG("ERROR: Packet REJECTED, unsupported frequency - %u (min:%u,max:%u)\n", txpkt.freq_hz, tx_freq_min[txpkt.rf_chain], tx_freq_max[txpkt.rf_chain]);
             }
             if (jit_result == JIT_ERROR_OK) {
-                for (i=0; i<txlut.size; i++) {
-                    if (txlut.lut[i].rf_power == txpkt.rf_power) {
-                        /* this RF power is supported, we can continue */
-                        break;
-                    }
-                }
-                if (i == txlut.size) {
-                    /* this RF power is not supported */
-                    jit_result = JIT_ERROR_TX_POWER;
-                    MSG("ERROR: Packet REJECTED, unsupported RF power for TX - %d\n", txpkt.rf_power);
+                uint8_t tx_lut_idx = 0;
+                i = get_tx_gain_lut_index(txpkt.rf_power, &tx_lut_idx);
+                if ((i < 0) || (txlut.lut[tx_lut_idx].rf_power != txpkt.rf_power)) {
+                    /* this RF power is not supported, throw a warning, and use the closest lower power supported */
+                    warning_result = JIT_ERROR_TX_POWER;
+                    warning_value = txlut.lut[tx_lut_idx].rf_power;
+                    MSG("WARNING: Requested TX power is not supported (%ddBm), actual power used: %ddBm\n", txpkt.rf_power, warning_value);
+                    txpkt.rf_power = txlut.lut[tx_lut_idx].rf_power;
                 }
             }
 
@@ -2534,6 +2605,8 @@ void thread_down(void) {
                 jit_result = jit_enqueue(&jit_queue, &current_concentrator_time, &txpkt, downlink_type);
                 if (jit_result != JIT_ERROR_OK) {
                     printf("ERROR: Packet REJECTED (jit error=%d)\n", jit_result);
+                } else {
+                    jit_result = warning_result;
                 }
                 pthread_mutex_lock(&mx_meas_dw);
                 meas_nb_tx_requested += 1;
@@ -2541,7 +2614,7 @@ void thread_down(void) {
             }
 
             /* Send acknoledge datagram to server */
-            send_tx_ack(buff_down[1], buff_down[2], jit_result);
+            send_tx_ack(buff_down[1], buff_down[2], jit_result, warning_value);
         }
     }
     MSG("\nINFO: End of downstream thread\n");
