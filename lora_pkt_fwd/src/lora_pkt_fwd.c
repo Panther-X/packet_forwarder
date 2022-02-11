@@ -1808,7 +1808,8 @@ void thread_up(void) {
             }
 
             /* Packet RSSI, payload size, 18-23 useful chars */
-            j = snprintf((char *)(buff_up + buff_index), TX_BUFF_SIZE-buff_index, ",\"rssi\":%.0f,\"size\":%u", p->rssi, p->size);
+            /* This code is inspired from http://community.heltec.cn/t/heltec-ht-m2808-rssi-sensitivity/7481/47 */
+            j = snprintf((char *)(buff_up + buff_index), TX_BUFF_SIZE-buff_index, ",\"rssi\":%.0f,\"size\":%u", (p->snr<0)?(p->rssi+p->snr):(p->rssi), p->size);
             if (j > 0) {
                 buff_index += j;
             } else {
